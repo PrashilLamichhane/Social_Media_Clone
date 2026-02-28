@@ -1,5 +1,7 @@
 import shutil
+from sys import exception
 import tempfile
+from unittest import result
 
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
 from app.schemas import PostCreate
@@ -110,3 +112,19 @@ async def get_feed(session:AsyncSession = Depends(get_async_session)):
             "created_at": post.created_at.isoformat()
         })
     return post_data
+
+@app.delete("/delete/{post_id}")
+async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_session)):
+    try:
+        post_uuid = uuid.UUID(post_id)
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        post = result.scalar_one_or_none()
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+        # Delete from ImageKit
+        await session.delete(post)
+        await session.commit()
+        return {"detail": "Post deleted successfully"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting post: {str(e)}")
