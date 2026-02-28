@@ -1,8 +1,16 @@
-from fastapi import FastAPI, HTTPException
+import shutil
+import tempfile
+
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
 from app.schemas import PostCreate
 from app.db import create_db_and_tables, get_async_session, Post
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.image import imagekit
+
+import shutil, os, uuid, tempfile
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -12,42 +20,93 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-text_post = {
-    1: {"title": "First Post", "content": "This is the content for the first post."},
-    2: {"title": "Morning Thoughts", "content": "Every morning is a new chance to start fresh."},
-    3: {"title": "Daily Motivation", "content": "Small steps every day lead to big results."},
-    4: {"title": "Tech Talk", "content": "Technology moves fast—keep learning or fall behind."},
-    5: {"title": "Life Lesson", "content": "Failure is not the opposite of success; it’s part of it."},
-    6: {"title": "Quick Reminder", "content": "Don’t forget to take breaks and breathe."},
-    7: {"title": "Creative Spark", "content": "Ideas grow when you give them time and attention."},
-    8: {"title": "Productivity Tip", "content": "Focus on finishing, not perfecting."},
-    9: {"title": "Evening Reflection", "content": "What you did today matters more than what you planned."},
-    10: {"title": "Final Thought", "content": "Consistency beats intensity in the long run."}
-}
 
-
-@app.get("/posts")
-def get_posts():
-    return text_post
-
-@app.get("/posts/{id}")
-def get_post_by_id(id :int ):
-
-    if id not in text_post:
+@app.post("/upload")
+async def upload_file(
+    file : UploadFile = File(...),
+    caption: str = Form(...),
+    session:AsyncSession = Depends(get_async_session)
+):
+    
+    temp_file_path = None
+    temp_file_obj = None
+    try:
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            # Copy the uploaded file content to the temp file
+            shutil.copyfileobj(file.file, temp_file)
+       
+        # Open the temp file for upload
+        temp_file_obj = open(temp_file_path, "rb")
         
-        raise HTTPException(status_code=404, detail="Post not found")
+        # Upload to ImageKit using the correct SDK method
+        upload_result = imagekit.files.upload(
+            file=temp_file_obj,
+            file_name=file.filename,
+        )
+        
+        # If upload is successful, the result object will have file_id, url, etc.
+        # If there's an error, an exception will be raised
+        if upload_result and upload_result.file_id:
+            # Create post in database
+            post = Post(
+                caption=caption, 
+                url=upload_result.url,
+                file_type= "video" if file.content_type.startswith("video/") else "image",
+                file_name=upload_result.name
+            )
+            
+            # Update the session
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
+            
+            return {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat(),
+                "file_id": upload_result.file_id
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="ImageKit upload failed - no file_id returned"
+            )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+    finally:
+        # Close the temp file object if it was opened
+        if temp_file_obj:
+            temp_file_obj.close()
+        
+        # Delete the temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        
+        # Close the uploaded file
+        file.file.close()
     
-    else: 
-
-         return text_post[id]
-    
-
-@app.post("/posts")
-def create_post(post: PostCreate):
-    new_post = {
-        "title": post.title,
-        "content": post.content
-    }
-    text_post[max(text_post.keys()) + 1] = new_post
 
 
+@app.get("/feed")
+async def get_feed(session:AsyncSession = Depends(get_async_session)):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.fetchall()]
+
+    post_data = []
+    for post in posts:
+        post_data.append({
+            "id": str(post.id),
+            "caption": post.caption,
+            "url": post.url,
+            "file_type": post.file_type,
+            "file_name": post.file_name,
+            "created_at": post.created_at.isoformat()
+        })
+    return post_data
